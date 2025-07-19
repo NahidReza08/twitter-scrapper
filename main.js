@@ -1,49 +1,73 @@
-const fs = require('fs');
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
 
-(async () => {
-  // Load cookies from file
-  const cookies = JSON.parse(fs.readFileSync('cookies.json', 'utf8')).map(cookie => {
+const cookiesPath = path.join(__dirname, 'cookies.json');
+const outputPath = path.join(__dirname, 'tweets.json');
+
+async function scrapeTweets({ url, scrolls = 5 }) {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+
+  if (!fs.existsSync(cookiesPath)) {
+    console.error('cookies.json not found. Please export your Twitter cookies.');
+    return;
+  }
+
+  // Load cookies from file with sameSite fix
+  const cookies = JSON.parse(fs.readFileSync(cookiesPath, 'utf8')).map(cookie => {
     if (cookie.sameSite && !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) {
-      cookie.sameSite = 'Lax'; // Fix for invalid sameSite value
+      cookie.sameSite = 'None'; // Fix for invalid sameSite value
     }
     return cookie;
   });
-
-  // Launch browser
-  const browser = await chromium.launch({ headless: false, slowMo: 50 });
-  const context = await browser.newContext();
   await context.addCookies(cookies);
+
   const page = await context.newPage();
 
-  // Keyword-based search URL
-  const searchQuery = 'open ai ghibli chatgpt';
-  const encodedQuery = encodeURIComponent(searchQuery);
-  const searchUrl = `https://x.com/search?q=${encodedQuery}&src=typed_query&f=top`;
+  await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+  await page.waitForTimeout(3000);
 
-  // Navigate and wait until basic DOM is loaded (not networkidle!)
-  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  // Scroll to load more tweets
+  for (let i = 0; i < scrolls; i++) {
+    await page.mouse.wheel(0, 5000);
+    await page.waitForTimeout(2000);
+  }
 
-  // Optional: wait for tweets to render
-  await page.waitForSelector('article', { timeout: 15000 });
+  const tweets = await page.$$eval('article', articles => {
+    return articles.map(article => {
+      const tweetTextEl = article.querySelector('div[lang]');
+      const userEl = article.querySelector('div.r-1f6r7vd > div > div > div > a');
+      const timeEl = article.querySelector('time');
+      const tweetLink = timeEl?.closest('a')?.href;
 
-  // Scrape tweet content with emoji (get full HTML and innerText both)
-  const tweets = await page.$$eval('article', articles =>
-    articles.map(article => {
-      const html = article.innerHTML;
-      const text = article.innerText;
-      return { html, text };
-    })
-  );
-
-  // Output
-  console.log(`Scraped ${tweets.length} tweets for query "${searchQuery}"`);
-  tweets.forEach((t, i) => {
-    console.log(`\n--- Tweet ${i + 1} ---\nText: ${t.text}`);
+      return {
+        user: userEl?.getAttribute('href')?.replace('/', '') || null,
+        text: tweetTextEl?.textContent || '',
+        time: timeEl?.getAttribute('datetime') || null,
+        url: tweetLink || null
+      };
+    });
   });
 
-  // Optionally save full HTML for emoji-preserved scraping
-  fs.writeFileSync('tweets.json', JSON.stringify(tweets, null, 2));
+  // Save to JSON file
+  fs.writeFileSync(outputPath, JSON.stringify(tweets, null, 2), 'utf-8');
+  console.log(`\nScraped ${tweets.length} tweets. Saved to tweets.json\n`);
 
   await browser.close();
-})();
+}
+
+// CLI argument handling
+const argv = require('yargs')
+  .option('url', {
+    type: 'string',
+    describe: 'Full Twitter URL (profile or search)',
+    default: 'https://x.com/home'
+  })
+  .option('scrolls', {
+    type: 'number',
+    describe: 'Number of times to scroll to load tweets',
+    default: 5
+  }).argv;
+
+scrapeTweets(argv);
